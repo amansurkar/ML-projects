@@ -1,0 +1,377 @@
+# Import necessary libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, classification_report
+from sklearn.impute import SimpleImputer
+import xgboost as xgb
+import mlflow
+import mlflow.sklearn
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# Load the dataset
+def load_data(file_path):
+    """
+    Load the loan dataset from a CSV file
+    """
+    print("Loading dataset...")
+    df = pd.read_csv(file_path)
+    print(f"Dataset loaded with {df.shape[0]} rows and {df.shape[1]} columns")
+    return df
+
+# Exploratory Data Analysis
+def perform_eda(df):
+    """
+    Perform exploratory data analysis
+    """
+    print("Performing exploratory data analysis...")
+    
+    # Display basic information
+    print("\nBasic Information:")
+    print(df.info())
+    
+    # Display basic statistics
+    print("\nBasic Statistics:")
+    print(df.describe())
+    
+    # Check for missing values
+    print("\nMissing Values:")
+    missing_values = df.isnull().sum()
+    print(missing_values[missing_values > 0])
+    
+    # Check target variable distribution
+    print("\nTarget Variable Distribution:")
+    print(df['loan_default'].value_counts(normalize=True) * 100)
+    
+    # Create visualizations
+    plt.figure(figsize=(12, 8))
+    
+    # Target distribution
+    plt.subplot(2, 2, 1)
+    sns.countplot(x='loan_default', data=df)
+    plt.title('Default Distribution')
+    
+    # Correlation matrix
+    plt.subplot(2, 2, 2)
+    correlation_matrix = df.select_dtypes(include=[np.number]).corr()
+    sns.heatmap(correlation_matrix, annot=False, cmap='coolwarm', vmin=-1, vmax=1)
+    plt.title('Correlation Matrix')
+    
+    # Income vs Loan Amount
+    plt.subplot(2, 2, 3)
+    sns.scatterplot(x='income', y='loan_amount', hue='loan_default', data=df)
+    plt.title('Income vs Loan Amount')
+    
+    # Credit Score Distribution
+    plt.subplot(2, 2, 4)
+    sns.histplot(data=df, x='credit_score', hue='loan_default', kde=True)
+    plt.title('Credit Score Distribution by Default Status')
+    
+    plt.tight_layout()
+    plt.savefig('eda_visualizations.png')
+    
+    return correlation_matrix
+
+# Feature Engineering
+def engineer_features(df):
+    """
+    Create new features to improve model performance
+    """
+    print("Engineering new features...")
+    
+    # Create a copy of the dataframe to avoid modifying the original
+    df_features = df.copy()
+    
+    # Payment-to-income ratio
+    df_features['payment_to_income'] = df_features['monthly_payment'] / df_features['income']
+    
+    # Loan-to-value ratio (if applicable for the loan type)
+    if 'property_value' in df_features.columns and 'loan_amount' in df_features.columns:
+        df_features['loan_to_value'] = df_features['loan_amount'] / df_features['property_value']
+    
+    # Credit utilization
+    if 'credit_limit' in df_features.columns and 'credit_balance' in df_features.columns:
+        df_features['credit_utilization'] = df_features['credit_balance'] / df_features['credit_limit']
+    
+    # Debt-to-income ratio
+    if 'total_debt' in df_features.columns:
+        df_features['debt_to_income'] = df_features['total_debt'] / df_features['income']
+    
+    # Employment stability (years at current job / age)
+    if 'employment_length' in df_features.columns and 'age' in df_features.columns:
+        df_features['employment_stability'] = df_features['employment_length'] / df_features['age']
+    
+    # Number of credit accounts to credit age ratio
+    if 'num_credit_accounts' in df_features.columns and 'credit_history_length' in df_features.columns:
+        df_features['account_to_history_ratio'] = df_features['num_credit_accounts'] / df_features['credit_history_length']
+    
+    # Log transform skewed numerical features
+    skewed_features = ['loan_amount', 'income']
+    for feature in skewed_features:
+        if feature in df_features.columns:
+            df_features[f'{feature}_log'] = np.log1p(df_features[feature])
+    
+    # Create interaction features
+    df_features['score_to_loan'] = df_features['credit_score'] / df_features['loan_amount']
+    
+    # Create binary features
+    if 'past_delinquency' in df_features.columns:
+        df_features['has_delinquency'] = (df_features['past_delinquency'] > 0).astype(int)
+    
+    print(f"Created {df_features.shape[1] - df.shape[1]} new features")
+    
+    return df_features
+
+# Data Preprocessing
+def preprocess_data(df):
+    """
+    Perform data preprocessing including handling missing values,
+    encoding categorical variables, and scaling numerical features
+    """
+    print("Preprocessing data...")
+    
+    # Separate features and target
+    X = df.drop('loan_default', axis=1)
+    y = df['loan_default']
+    
+    # Identify categorical and numerical columns
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    
+    print(f"Categorical columns: {len(categorical_cols)}")
+    print(f"Numerical columns: {len(numerical_cols)}")
+    
+    # Create preprocessing pipelines
+    numerical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+    
+    # Combine preprocessing steps
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_transformer, numerical_cols),
+            ('cat', categorical_transformer, categorical_cols)
+        ])
+    
+    # Split the data
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+    
+    return X_train, X_test, y_train, y_test, preprocessor
+
+# Train Random Forest model
+def train_random_forest(X_train, y_train, preprocessor):
+    """
+    Train a Random Forest classifier with hyperparameter tuning
+    """
+    print("Training Random Forest model...")
+    
+    # Create a pipeline with preprocessing and model
+    rf_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('classifier', RandomForestClassifier(random_state=42))
+    ])
+    
+    # Define hyperparameters for tuning
+    param_grid = {
+        'classifier__n_estimators': [50, 100],
+        'classifier__max_depth': [8, 12],
+        'classifier__min_samples_split': [5, 10]
+    }
+    
+    # Set up MLflow tracking
+    mlflow.set_experiment("Loan Default Prediction - Random Forest")
+    
+    with mlflow.start_run(run_name="RandomForest_GridSearch"):
+        # Perform grid search with cross-validation
+        grid_search = GridSearchCV(
+            rf_pipeline,
+            param_grid=param_grid,
+            cv=5,
+            scoring='accuracy',
+            n_jobs=-1
+        )
+        
+        # Fit the model
+        grid_search.fit(X_train, y_train)
+        
+        # Log parameters and metrics
+        best_params = grid_search.best_params_
+        for param, value in best_params.items():
+            mlflow.log_param(param, value)
+        
+        mlflow.log_metric("cv_accuracy", grid_search.best_score_)
+        
+        # Save the best model
+        best_rf_model = grid_search.best_estimator_
+        mlflow.sklearn.log_model(best_rf_model, "random_forest_model")
+        
+        print(f"Best parameters: {best_params}")
+        print(f"Cross-validation accuracy: {grid_search.best_score_:.4f}")
+    
+    return best_rf_model
+
+# Train XGBoost model
+def train_xgboost(X_train, y_train, preprocessor):
+    """
+    Train an XGBoost classifier with hyperparameter tuning
+    """
+    print("Training XGBoost model...")
+    
+    # Create a pipeline with preprocessing and model
+    xgb_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('classifier', xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss'))
+    ])
+    
+    # Define hyperparameters for tuning
+    param_grid = {
+        'classifier__learning_rate': [0.05, 0.1],
+        'classifier__max_depth': [6, 8],
+        'classifier__subsample': [0.8, 0.9],
+        'classifier__colsample_bytree': [0.8, 0.9],
+        'classifier__reg_alpha': [0, 0.1]
+    }
+    
+    # Set up MLflow tracking
+    mlflow.set_experiment("Loan Default Prediction - XGBoost")
+    
+    with mlflow.start_run(run_name="XGBoost_GridSearch"):
+        # Perform grid search with cross-validation
+        grid_search = GridSearchCV(
+            xgb_pipeline,
+            param_grid=param_grid,
+            cv=5,
+            scoring='accuracy',
+            n_jobs=-1
+        )
+        
+        # Fit the model
+        grid_search.fit(X_train, y_train)
+        
+        # Log parameters and metrics
+        best_params = grid_search.best_params_
+        for param, value in best_params.items():
+            mlflow.log_param(param, value)
+        
+        mlflow.log_metric("cv_accuracy", grid_search.best_score_)
+        
+        # Save the best model
+        best_xgb_model = grid_search.best_estimator_
+        mlflow.sklearn.log_model(best_xgb_model, "xgboost_model")
+        
+        print(f"Best parameters: {best_params}")
+        print(f"Cross-validation accuracy: {grid_search.best_score_:.4f}")
+    
+    return best_xgb_model
+
+# Evaluate model performance
+def evaluate_model(model, X_test, y_test, model_name):
+    """
+    Evaluate model performance on the test set
+    """
+    print(f"\nEvaluating {model_name} model...")
+    
+    # Make predictions
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc_roc = roc_auc_score(y_test, y_prob)
+    
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"AUC-ROC: {auc_roc:.4f}")
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['No Default', 'Default'],
+                yticklabels=['No Default', 'Default'])
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.savefig(f'{model_name.lower().replace(" ", "_")}_confusion_matrix.png')
+    
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+    
+    # ROC curve
+    plt.figure(figsize=(8, 6))
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    plt.plot(fpr, tpr, label=f'AUC = {auc_roc:.4f}')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'ROC Curve - {model_name}')
+    plt.legend(loc='lower right')
+    plt.savefig(f'{model_name.lower().replace(" ", "_")}_roc_curve.png')
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc_roc': auc_roc
+    }
+
+# Feature importance analysis
+def analyze_feature_importance(model, X_train, preprocessor, model_name):
+    """
+    Analyze and visualize feature importance
+    """
+    print(f"\nAnalyzing feature importance for {model_name}...")
+    
+    # Get feature names after preprocessing
+    if hasattr(preprocessor, 'transformers_'):
+        # For fitted preprocessors
+        cat_features = preprocessor.transformers_[1][1]['onehot'].get_feature_names_out(
+            input_features=preprocessor.transformers_[1][2]
+        )
+        feature_names = np.append(preprocessor.transformers_[0][2], cat_features)
+    else:
+        # Fallback if preprocessor is not fitted
+        feature_names = np.array([f"feature_{i}" for i in range(X_train.shape[1])])
+    
+    # Extract model from pipeline
+    if model_name == "Random Forest":
+        # For Random Forest
+        importances = model.named_steps['classifier'].feature_importances_
+    else:
+        # For XGBoost
+        importances = model.named_steps['classifier'].feature_importances_
+    
+    # Sort features by importance
+    indices = np.argsort(importances)[::-1]
+    
+    # Plot feature importance
+    plt.figure(figsize=(12, 8))
+    plt.title(f'Feature Importance - {model_name}')
+    plt.bar(range(min(20, len(indices))), importances[indices[:20]], align='
